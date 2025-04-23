@@ -21,7 +21,8 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"
-                   ,"https://accounts.google.com" ],
+                   ,"https://accounts.google.com"
+                   ,"https://6809564ebfb7a056e977017f--fuudiy.netlify.app/" ],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -50,4 +51,7 @@ app.state.database = database
 def shutdown_event():
     spark.stop()  # Properly stop Spark session
     print("Spark session stopped")
+
+if __name__ == "__main__":
+     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
     
