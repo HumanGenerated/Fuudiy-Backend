@@ -12,6 +12,7 @@ from server.routes.explore import router as ExploreRouter
 from server.routes.search import router as SearchRouter
 from spark_utils import spark
 #from server.routes.similarity_explore import
+import os
 
 #from server.routes.translation import router as TranslationRouter
 import uvicorn
@@ -54,3 +55,7 @@ def shutdown_event():
 #if __name__ == "__main__":
  #    uvicorn.run("app:app", host="0.0.0.0", port=8000)
     
+port = int(os.environ.get("PORT", 8000))  # 8000 as fallback
+
+if __name__ == "__main__":
+    uvicorn.run("app:app", host="0.0.0.0", port=port)
