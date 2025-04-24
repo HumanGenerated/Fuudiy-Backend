@@ -31,7 +31,7 @@ from server.services.comment_service import update_rate_for_comment  # ✅ FIXED
 
 
 #current_file = Path(__file__)
-credentials_path = "/etc/secrets/gcs-key.json"
+credentials_path = "gcs-key.json"
 
 router = APIRouter()
 food_collection = database.get_collection("foods")
