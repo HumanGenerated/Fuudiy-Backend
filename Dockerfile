@@ -1,5 +1,5 @@
 # Base image with Java 11 (needed for PySpark)
-FROM openjdk:17-slim
+FROM python:3.11-slim
 
 # Avoid interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
@@ -37,9 +37,9 @@ ENV PORT=8000
 # Expose FastAPI port
 EXPOSE 8000
 
-COPY gcs-key.json gcs-key.json
+# COPY gcs-key.json gcs-key.json
 
-ENV LOG4J_DISABLE_JMX=true
+# ENV LOG4J_DISABLE_JMX=true
 
 # Default start command
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
