@@ -10,7 +10,6 @@ from server.routes.connection import router as ConnectionRouter
 from server.database import database
 from server.routes.explore import router as ExploreRouter
 from server.routes.search import router as SearchRouter
-from spark_utils import spark
 #from server.routes.similarity_explore import
 
 #from server.routes.translation import router as TranslationRouter
@@ -49,7 +48,6 @@ async def read_root():
 app.state.database = database
 @app.on_event("shutdown")
 def shutdown_event():
-    spark.stop()  # Properly stop Spark session
     print("Spark session stopped")
 
 if __name__ == "__main__":
