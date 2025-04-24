@@ -1,29 +1,30 @@
-FROM python:3.9-dev
+FROM python:3.11-slim
 
 # Avoid interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install Python 3.9, pip, and build essentials
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.9 \
-    python3.9-dev \
-    python3-pip \
+RUN apt-get update && apt-get install -y \
     gcc \
+    python3-dev \
+    libpq-dev \
+    gfortran \
+    libblas-dev \
+    liblapack-dev \
+    unixodbc-dev \
+    unixodbc \
     g++ \
-    curl \
-    procps \
-    libc6 \
-    libsnappy1v5 \
-    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Set python3.9 as default
-RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.9 1
+#RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.9 1
 
 # Copy and install Python dependencies with PyTorch CPU wheel
-COPY requirements.txt /tmp/requirements.txt
-RUN pip install --upgrade pip \
- && pip install --extra-index-url https://download.pytorch.org/whl/cpu -r /tmp/requirements.txt
+COPY requirements.txt .
+
+# Update pip and install Python dependencies
+RUN pip install --upgrade pip && \
+    pip install -r requirements.txt
 
 # Set working directory and copy project
 WORKDIR /app/app
