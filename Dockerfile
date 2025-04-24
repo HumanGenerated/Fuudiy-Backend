@@ -1,5 +1,4 @@
-# Base image with Java 11 (needed for PySpark)
-FROM python:3.11-slim
+FROM python:3.9-dev
 
 # Avoid interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
