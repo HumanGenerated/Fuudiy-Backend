@@ -1,27 +1,20 @@
-
 import re
-from spark_utils import spark
-from pyspark.sql import functions as F
-from pyspark.sql import Row 
-from pyspark.sql.types import ArrayType
-from pyspark.ml.feature import IDF
-from pyspark.ml.feature import CountVectorizer
-from pyspark.ml import Pipeline
-from pyspark.sql.types import ArrayType, DoubleType
-from pyspark.ml.functions import vector_to_array
-from config import MONGO_URI, DATABASE_NAME, COLLECTION_FOOD, COLLECTION_SURVEY, COLLECTION_USER_COMMENTS
+import numpy as np
+import pandas as pd
+from collections import defaultdict
+from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, HTTPException, Depends, Query
 from ..services.auth_service import get_current_user
 import traceback
-from collections import defaultdict
-from typing import Optional
+from pymongo import MongoClient
+from bson import ObjectId
+from config import MONGO_URI, DATABASE_NAME, COLLECTION_FOOD, COLLECTION_SURVEY, COLLECTION_USER_COMMENTS
 
 router = APIRouter()
 
-from pymongo import MongoClient
-
 client = MongoClient(MONGO_URI)
-db = client["fuudiy"]
+db = client[DATABASE_NAME]
+
 DISH_INGREDIENT_MAP = {
     "vegetarian_dishes": ["lettuce", "tomato"],
     "meat_dishes": ["meat", "lamb", "beef", "steak"],
@@ -45,64 +38,49 @@ RATING_ADJUSTMENTS = {
     1: -2.0
 }
 
-def load_food_data(spark, collection_name):
-    """Secure data loading with proper environment variables"""
-    return spark.read.format("mongodb") \
-        .option("uri", MONGO_URI) \
-        .option("database", DATABASE_NAME) \
-        .option("collection", collection_name) \
-        .load()
+def convert_objectid_to_str(obj: Any) -> Any:
+    """Convert ObjectId to string in nested dictionaries"""
+    if isinstance(obj, ObjectId):
+        return str(obj)
+    elif isinstance(obj, dict):
+        return {k: convert_objectid_to_str(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_objectid_to_str(item) for item in obj]
+    return obj
 
+def load_collection(coll_name: str) -> List[Dict]:
+    """Load data from MongoDB collection"""
+    return list(db[coll_name].find())
 
-survey_df = load_food_data(spark, COLLECTION_SURVEY).cache()
+def parse_prefs(value: Any) -> List[str]:
+    """Parse preferences from string or list"""
+    if isinstance(value, str):
+        return [x.strip().lower() for x in value.split(",") if x.strip()]
+    return value if isinstance(value, list) else []
 
-food_df = (
-    load_food_data(spark, COLLECTION_FOOD)
-    .select("_id", "country", "ingredients", "name", "url_id")
-    .filter(F.size(F.col("ingredients")) > 0)
-    .filter(F.col("ingredients").isNotNull())  # Add null check
-    .cache()
-)
-
-
-def get_user_preferences(user_id):
-    survey = survey_df.filter(F.col("user_id") == user_id).first()
-    if not survey:
-        raise HTTPException(400, "Survey missing")
-    
-    prefs = survey.asDict().get("responses", {})
-    return prefs.asDict() if isinstance(prefs, Row) else prefs
-
-def parse_prefs(value):
-        if isinstance(value, str):
-            return [x.strip().lower() for x in value.split(",")]
-        return value if isinstance(value, list) else []
-
-def filter_disliked_allergies(df, disliked, allergies=None):
-    all_exclusions = list(disliked)
+def filter_disliked_allergies(foods: List[Dict], disliked: List[str], allergies: Optional[List[str]] = None) -> List[Dict]:
+    """Filter foods based on disliked ingredients and allergies"""
+    all_exclusions = set(disliked)
     if allergies:
-        all_exclusions += list(allergies)
+        all_exclusions.update(allergies)
     
     if not all_exclusions:
-        return df
+        return foods
 
-    exclusion_array = F.array(*[F.lit(e) for e in all_exclusions])
+    return [
+        f for f in foods
+        if f.get('ingredients')
+        and not any(ing in all_exclusions for ing in f.get('ingredients', []))
+    ]
 
-    return df.filter(
-        F.size(
-            F.array_intersect(F.col("ingredients"), exclusion_array)
-        ) == 0
-    )
-
-def calculate_ingredient_adjustments(prefs):
+def calculate_ingredient_adjustments(prefs: Dict) -> Dict[str, float]:
+    """Calculate ingredient adjustments based on user preferences"""
     adjustments = defaultdict(float)
     
     food_prefs = prefs.get("food_preferences", {})
     
     if isinstance(food_prefs, list):
         food_prefs = {item["key"]: item["value"] for item in food_prefs}
-    elif isinstance(food_prefs, Row):
-        food_prefs = food_prefs.asDict()
     
     for dish, ingredients in DISH_INGREDIENT_MAP.items():
         raw_rating = prefs.get(dish) or food_prefs.get(dish)
@@ -119,7 +97,7 @@ def calculate_ingredient_adjustments(prefs):
                     "likes": 3, 
                     "neutral": 3,
                     "dislikes": 1
-                }.get(clean_rating, 3)  # Default to 3 if unknown string
+                }.get(clean_rating, 3)
 
         adj = RATING_ADJUSTMENTS.get(numerical_rating, 0.0)
         for ingredient in ingredients:
@@ -127,281 +105,184 @@ def calculate_ingredient_adjustments(prefs):
             
     return adjustments
 
-# 3. TF-IDF Pipeline
-tfidf_pipeline = Pipeline(stages=[
-    CountVectorizer(inputCol="ingredients", outputCol="rawFeatures", vocabSize=10000),
-    IDF(inputCol="rawFeatures", outputCol="features")
-]).fit(food_df)
-
-food_df = tfidf_pipeline.transform(food_df)
-#food_df.unpersist()
-vector_to_array = F.udf(lambda v: v.toArray().tolist(), ArrayType(DoubleType()))
-
-# ---------- Recommendation Endpoint ----------
-@router.get("/recommend/")
-async def recommend_foods(country: str = Query(..., title="Target country"), diet: Optional[str] = Query(None, title="Dietary restriction"), user_id: str = Depends(get_current_user), top_n: int = 10):
+def calculate_tfidf_scores(foods: List[Dict]) -> List[Dict]:
+    """Calculate TF-IDF scores for foods based on ingredients"""
+    # Create a vocabulary of all ingredients
+    all_ingredients = set()
+    for food in foods:
+        all_ingredients.update(food.get('ingredients', []))
+    vocab = list(all_ingredients)
     
-    print(f"Received country: {country}, user_id: {user_id}")  # Debugging
+    # Calculate document frequency
+    df = defaultdict(int)
+    for food in foods:
+        for ing in set(food.get('ingredients', [])):
+            df[ing] += 1
+    
+    # Calculate TF-IDF scores
+    for food in foods:
+        ingredients = food.get('ingredients', [])
+        tfidf_score = 0.0
+        for ing in ingredients:
+            tf = ingredients.count(ing) / len(ingredients)
+            idf = np.log(len(foods) / (df[ing] + 1))
+            tfidf_score += tf * idf
+        food['tfidf_score'] = tfidf_score
+    
+    return foods
+
+@router.get("/recommend/")
+async def recommend_foods(
+    country: str = Query(..., title="Target country"),
+    diet: Optional[str] = Query(None, title="Dietary restriction"),
+    user_id: str = Depends(get_current_user),
+    top_n: int = 10
+):
     try:
-        if diet is not None:
-            print("Diet:", diet)
+        # Load data
+        all_foods = load_collection(COLLECTION_FOOD)
+        all_surveys = load_collection(COLLECTION_SURVEY)
+        all_comments = load_collection(COLLECTION_USER_COMMENTS)
+
+        # Get user preferences
+        user_survey = next((s for s in all_surveys if s.get('user_id') == user_id), None)
+        if not user_survey:
+            raise HTTPException(400, "Survey missing")
+        prefs = user_survey.get("responses", {})
+
+        # Prepare allergy/diet filters
+        exclusion_ingredients = set()
+        if diet:
             restrictions = db["special_diet"].find_one({"category": diet.lower()})
-            exclusion_ingredients = restrictions.get("restricted_ingredients", []) if restrictions else []
-        else:
-            exclusion_ingredients = []
-            print("No diet filter")
-        # 2. Validate user survey
-        prefs = get_user_preferences(user_id)
-        if isinstance(prefs, Row):  # If responses is stored as Row
-            prefs = prefs.asDict()
+            exclusion_ingredients = set(restrictions.get("restricted_ingredients", [])) if restrictions else set()
 
-        """
-        liked = set(parse_prefs(prefs.get("liked_ingredients")))
-        print("Liked:  ",liked)
-        
-        disliked = set(parse_prefs(prefs.get("disliked_ingredients"))) | \
-                set(parse_prefs(prefs.get("allergies")))
-        print("DisLiked:  ",disliked)
-        """
+        disliked = set(parse_prefs(prefs.get("disliked_ingredients", [])))
+        allergies = set(parse_prefs(prefs.get("allergies", [])))
+        all_exclusions = disliked | allergies | exclusion_ingredients
 
+        # Calculate ingredient adjustments
         ingredient_adjustments = calculate_ingredient_adjustments(prefs)
 
-        user_comments_df = load_food_data(spark, COLLECTION_USER_COMMENTS).cache()
+        # Filter and score foods
+        filtered_foods = [
+            f for f in all_foods
+            if f.get('country') == country
+            and f.get('ingredients')
+            and not any(ing in all_exclusions for ing in f.get('ingredients', []))
+        ]
 
-        user_comments_filtered = user_comments_df.filter(F.col("userId") == user_id)
+        # Calculate TF-IDF scores
+        filtered_foods = calculate_tfidf_scores(filtered_foods)
 
-        commented_foods = user_comments_filtered.join(
-            food_df.select("_id", "ingredients"),
-            user_comments_filtered.foodId == food_df._id,
-            "inner"
-        ).select("rate", "ingredients")
+        # Add user rating adjustments
+        user_comments = [c for c in all_comments if c.get('userId') == user_id]
+        for food in filtered_foods:
+            food_comments = [c for c in user_comments if str(c.get('foodId')) == str(food['_id'])]
+            rating_adjustment = sum((float(c.get('rate', 3)) - 3) * 1.0 for c in food_comments)
+            ingredient_adjustment = sum(ingredient_adjustments.get(ing, 0.0) for ing in food.get('ingredients', []))
+            food['score'] = food.get('tfidf_score', 0.0) + ingredient_adjustment + rating_adjustment
 
-        commented_foods_data = commented_foods.collect()
+        # Get similar user recommendations
+        similar_users = []
+        user_high_rated_foods = {str(c.get('foodId')) for c in user_comments if float(c.get('rate', 0)) >= 4}
+        
+        for comment in all_comments:
+            if comment.get('userId') != user_id and float(comment.get('rate', 0)) >= 4:
+                if str(comment.get('foodId')) in user_high_rated_foods:
+                    similar_users.append(comment.get('userId'))
 
-        for row in commented_foods_data:
-            rate = row['rate']
-            ingredients = row['ingredients']
-            rate_val = float(rate) if rate is not None else 3.0
-            adjustment = (rate_val - 3) * 1.0
-            for ingredient in ingredients:
-                ingredient_adjustments[ingredient] += adjustment
+        similar_users_ratings = [
+            c for c in all_comments
+            if c.get('userId') in similar_users
+            and float(c.get('rate', 0)) >= 4
+            and str(c.get('foodId')) not in user_high_rated_foods
+        ]
 
-        bc_adjustments = spark.sparkContext.broadcast(ingredient_adjustments)
-        calculate_adjustment_udf = F.udf(
-            lambda ingredients: float(sum(
-                bc_adjustments.value.get(ing, 0.0) for ing in ingredients
-            )),
-            DoubleType()
-        )
-    
-        country_foods = filter_disliked_allergies(
-            food_df.filter(F.col("country") == country), 
-            disliked=parse_prefs(prefs.get("disliked_ingredients")),
-            allergies=set(parse_prefs(prefs.get("allergies"))) | set(exclusion_ingredients)
-        ).withColumn("score", 
-            F.aggregate(
-                vector_to_array("features"), 
-                F.lit(0.0), 
-                lambda acc, x: acc + x
-            ) + calculate_adjustment_udf(F.col("ingredients"))
-        )
+        similar_foods = []
+        for food_id in {c.get('foodId') for c in similar_users_ratings}:
+            food = next((f for f in all_foods if str(f['_id']) == str(food_id)), None)
+            if food and food.get('country') == country:
+                similar_foods.append(food)
 
-        country_foods = country_foods.withColumn(
-            "tfidf_array", 
-            vector_to_array("features")
-        )
+        # Sort and return results
+        filtered_foods.sort(key=lambda f: f['score'], reverse=True)
+        similar_foods.sort(key=lambda f: f.get('score', 0), reverse=True)
 
-        score_expr = """
-            aggregate(
-                tfidf_array,
-                CAST(0.0 AS DOUBLE),
-                (acc, x) -> acc + x
-            )
-        """
-        country_foods = country_foods.withColumn("tfidf_sum", F.expr(score_expr))
+        # Convert ObjectId to string before returning
+        filtered_foods = convert_objectid_to_str(filtered_foods[:top_n])
+        similar_foods = convert_objectid_to_str(similar_foods[:5])
 
-        country_foods = country_foods.withColumn(
-            "adjustment_score", 
-            calculate_adjustment_udf(F.col("ingredients"))
-        )
-
-        country_foods = country_foods.withColumn(
-            "score", 
-            F.col("tfidf_sum") + F.col("adjustment_score")
-        )
-
-        current_user_high_ratings = user_comments_df.filter(
-            (F.col("userId") == user_id) & 
-            (F.col("rate") >= 4)
-        ).select("foodId").distinct()
-
-        similar_users = user_comments_df.filter(
-            (F.col("userId") != user_id) &
-            (F.col("rate") >= 4)
-        ).join(
-            current_user_high_ratings,
-            "foodId",
-            "inner"
-        ).select("userId").distinct()
-
-        similar_users_ratings = user_comments_df.filter(
-            F.col("userId").isin([u.userId for u in similar_users.collect()]) &
-            (F.col("rate") >= 4)
-        ).join(
-            current_user_high_ratings,
-            "foodId",
-            "left_anti"  # Exclude foods user already rated
-        )
-
-        similarity_recommendations = similar_users_ratings.groupBy("foodId") \
-            .agg(
-                F.count("*").alias("similar_user_count"),
-                F.avg("rate").alias("average_rating")
-            ) \
-            .orderBy(F.desc("similar_user_count"), F.desc("average_rating")) \
-            .limit(5)  # Top 5 most popular among similar users
-        #print("**************")
-        #print(similarity_recommendations.count())
-        #print("**************")
-        if similarity_recommendations.count() > 0:
-            #print("+++++++++++++++")
-            similar_foods = similarity_recommendations.join(
-                food_df.select("_id", "name", "country", "ingredients", "url_id"),
-                F.col("foodId") == F.col("_id"),
-                "inner"
-            ).select(
-                "_id",
-                "name",
-                "country",
-                "ingredients",
-                "url_id",
-                "similar_user_count",
-                "average_rating"
-            )
-            allergies = set(parse_prefs(prefs.get("allergies")))
-            #print(allergies)
-            if allergies or exclusion_ingredients:
-                similar_foods = filter_disliked_allergies(
-                    similar_foods,
-                    disliked={},
-                    allergies=set(parse_prefs(prefs.get("allergies"))) | set(exclusion_ingredients)
-                )
-                print(f"Remaining similar foods after allergen check: {similar_foods.count()}")
-            else:
-                print("No allergens to filter")
-
-            similar_foods_json = similar_foods.toJSON().collect()
-        else:
-            similar_foods_json = []
-
-        recommendations = (
-            country_foods
-            .withColumn("score", F.expr(score_expr))
-            .orderBy(F.desc("score"))
-            .limit(top_n)
-            .select(
-                "_id",
-                "name",
-                "country",
-                "url_id",
-                "ingredients",
-                "score"
-            )
-        )
-
-        if exclusion_ingredients:
-            recommendations = filter_disliked_allergies(
-                recommendations,
-                disliked=[],
-                allergies=exclusion_ingredients
-            )
-        # ========== Combine Results ==========
-        main_recommendations = recommendations.toJSON().collect()
-        print("Successfully generated recommendations")
-        user_comments_df.unpersist()
-        survey_df.unpersist()
         return {
-            "personalized_recommendations": main_recommendations,
-            "similar_users_recommendations": similar_foods_json
+            "personalized_recommendations": filtered_foods,
+            "similar_users_recommendations": similar_foods
         }
 
     except Exception as e:
-        print(f"Error during recommendation generation: {str(e)}")
+        print(f"Error: {e}")
         traceback.print_exc()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Recommendation engine failed: {str(e)}"
-        )
+        raise HTTPException(500, f"Recommendation engine failed: {e}")
 
+def cosine_similarity(list1: List[str], list2: List[str]) -> float:
+    """Calculate cosine similarity between two lists of ingredients"""
+    all_ings = list(set(list1) | set(list2))
+    v1 = np.array([1 if ing in list1 else 0 for ing in all_ings])
+    v2 = np.array([1 if ing in list2 else 0 for ing in all_ings])
+    num = np.dot(v1, v2)
+    denom = (np.linalg.norm(v1) * np.linalg.norm(v2))
+    return float(num) / denom if denom != 0 else 0.0
 
 @router.get("/similar/{food_id}")
-async def get_similar_foods(food_id: str, country: str = Query(..., title="Target country"), diet: Optional[str] = Query(None, title="Dietary restriction"), user_id: str = Depends(get_current_user),top_n: int = 10):
+async def get_similar_foods(
+    food_id: str,
+    country: str = Query(..., title="Target country"),
+    diet: Optional[str] = Query(None, title="Dietary restriction"),
+    user_id: str = Depends(get_current_user),
+    top_n: int = 10
+):
     try:
-        
-        if diet is not None:
-            print("Diet:", diet)
-            restrictions = db["special_diet"].find_one({"category": diet.lower()})
-            exclusion_ingredients = restrictions.get("restricted_ingredients", []) if restrictions else []
-        else:
-            exclusion_ingredients = []
-            print("No diet filter")
-        country_count = food_df.filter(F.col("country") == country).count()
-        if country_count == 0:
-            raise HTTPException(400, detail=f"No foods available in {country}")
-
-        target_food = food_df.filter(F.col("_id") == food_id).first()
+        all_foods = load_collection(COLLECTION_FOOD)
+        target_food = next((f for f in all_foods if str(f['_id']) == food_id), None)
         if not target_food:
-            raise HTTPException(404, detail="Food not found")
-        
-        survey = survey_df.filter(F.col("user_id") == user_id).first()
-        if not survey:
+            raise HTTPException(404, "Food not found")
+        target_ings = target_food.get("ingredients", [])
+
+        # Get user preferences
+        all_surveys = load_collection(COLLECTION_SURVEY)
+        user_survey = next((s for s in all_surveys if s.get('user_id') == user_id), None)
+        if not user_survey:
             raise HTTPException(400, "Survey missing")
+        prefs = user_survey.get("responses", {})
+
+        # Prepare exclusions
+        exclusion_ingredients = set()
+        if diet:
+            restrictions = db["special_diet"].find_one({"category": diet.lower()})
+            exclusion_ingredients = set(restrictions.get("restricted_ingredients", [])) if restrictions else set()
+        allergies = set(parse_prefs(prefs.get("allergies", [])))
+        all_exclusions = allergies | exclusion_ingredients
+
+        # Filter and score similar foods
+        candidate_foods = [
+            f for f in all_foods
+            if f.get('country') == country
+            and str(f['_id']) != food_id
+            and f.get('ingredients')
+            and not any(ing in all_exclusions for ing in f.get('ingredients', []))
+        ]
+
+        for f in candidate_foods:
+            f['similarity'] = cosine_similarity(target_ings, f.get('ingredients', []))
+
+        candidate_foods.sort(key=lambda f: f['similarity'], reverse=True)
+
+        # Convert ObjectId to string before returning
+        candidate_foods = convert_objectid_to_str(candidate_foods[:top_n])
         
-        prefs = survey.asDict().get("responses", {})
-        if isinstance(prefs, Row):
-            prefs = prefs.asDict()
-
-        country_foods = food_df.filter(
-            (F.col("country") == country) & 
-            (F.col("_id") != food_id)
-        ) 
-        allergies = set(parse_prefs(prefs.get("allergies")))
-        if allergies or exclusion_ingredients:
-                country_foods = filter_disliked_allergies(
-                    country_foods.filter(F.col("country") == country),
-                    disliked={},
-                    allergies=set(parse_prefs(prefs.get("allergies"))) | set(exclusion_ingredients)
-                )
-                print(f"Remaining after filters: {country_foods.count()}")
-        else:
-            print("No filters applied")
-
-        target_vector = target_food.features
-        target_bc = spark.sparkContext.broadcast(target_vector)
-
-        def cosine_similarity(v):
-            t = target_bc.value
-            dot = float(t.dot(v))
-            norm = float(t.norm(2) * v.norm(2))
-            return dot / norm if norm != 0 else 0.0
-
-        similarity_udf = F.udf(cosine_similarity, DoubleType())
-
-        similar_foods = country_foods.withColumn(
-            "similarity", similarity_udf(F.col("features"))
-        ).orderBy(F.desc("similarity")).limit(top_n)
-
-        if exclusion_ingredients:
-            similar_foods = filter_disliked_allergies(
-                similar_foods,
-                disliked=[],
-                allergies=exclusion_ingredients
-            )
         return {
-            "results": similar_foods.select(
-                "_id", "name", "country", "ingredients", "similarity", "url_id"
-            ).toJSON().collect()
+            "results": candidate_foods
         }
+
     except Exception as e:
+        print(f"Error: {e}")
         traceback.print_exc()
-        raise HTTPException(500, detail=str(e))
+        raise HTTPException(500, str(e))
