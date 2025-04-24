@@ -1,5 +1,5 @@
 # Base image with Java 11 (needed for PySpark)
-FROM openjdk:11-slim
+FROM openjdk:17-slim
 
 # Avoid interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
@@ -13,6 +13,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     g++ \
     curl \
     procps \
+    libc6 \
+    libsnappy1v5 \
+    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Set python3.9 as default
@@ -29,9 +32,14 @@ COPY ./app /app/app
 
 
 ENV PYTHONPATH=/app
+ENV PORT=8000
 
 # Expose FastAPI port
 EXPOSE 8000
+
+COPY gcs-key.json gcs-key.json
+
+ENV LOG4J_DISABLE_JMX=true
 
 # Default start command
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
