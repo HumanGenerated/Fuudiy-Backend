@@ -30,8 +30,8 @@ from server.models.food import (
 from server.services.comment_service import update_rate_for_comment  # ✅ FIXED: Import this function
 
 
-current_file = Path(__file__)
-credentials_path = current_file.parents[3] / "gcs-key.json"
+#current_file = Path(__file__)
+credentials_path = "/etc/secrets/gcs-key.json"
 
 router = APIRouter()
 food_collection = database.get_collection("foods")
