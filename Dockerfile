@@ -27,8 +27,8 @@ RUN pip install --upgrade pip && \
     pip install -r requirements.txt
 
 # Set working directory and copy project
-WORKDIR /app/app
-COPY ./app /app/app
+WORKDIR /app
+COPY ./app /app
 
 
 ENV PYTHONPATH=/app
