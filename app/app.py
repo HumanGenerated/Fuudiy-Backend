@@ -21,8 +21,11 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://fuudiy.com:3000",
+                   "http://fuudiy.com",
+                   "https://fuudiy.com",
                    "https://fuudiy.com:3000",
-                   "fuudiy.com:3000"
+                   "fuudiy.com:3000",
+                   "fuudiy.com"
                    ,"https://accounts.google.com" ],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
