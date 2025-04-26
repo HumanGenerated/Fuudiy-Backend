@@ -56,7 +56,7 @@ def get_image_url(image_id: str) -> str:
         if not blob.exists():
             logger.info(f"Image {image_id} not found")
             # Invalidate cache for this image_id
-            get_image_url.cache_invalidate(image_id)
+            get_image_url.cache_clear()
             return None
 
         return blob.generate_signed_url(
@@ -84,7 +84,7 @@ async def fetch_image(image_id: str):
     url = get_image_url(image_id)
     if not url:
         # Immediately invalidate cache entry if image is missing
-        get_image_url.cache_invalidate(image_id)
+        get_image_url.cache_clear()
         raise HTTPException(status_code=404, detail="Image not found in GCS")
     return {"image_url": url}
 
